@@ -344,6 +344,15 @@ typedef uint64 *pagetable_t; // 512 PTEs
 #define PTE_X (1L << 3)
 #define PTE_U (1L << 4) // user can access
 
+//PTE_V: 
+//很多时候需要判断PTE是否有效(即PTE_V)
+//判断PTE是否是有效的原因是因为有一些页表里面只使用了页表里面的其中一部分, 
+//已经使用了的页表就是将对应的虚拟地址 和 物理地址 关联起来了
+//使用的这部分的PTE_V是有效的, 未使用的这部分的PTE_V是无效的
+
+
+
+
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
 

@@ -7,49 +7,60 @@
 #include "fs.h"
 
 /*
- * the kernel's page table.
+ * the kernel's page table. 内核页表的声明
  */
 pagetable_t kernel_pagetable;
 
+//暂时不知道是干啥的
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
+//这个是trampoline, 切换页表时用的, 比如从用户页表切换到内核页表
 extern char trampoline[]; // trampoline.S
 
 // Make a direct-map page table for the kernel.
+// 将内核页表和实际的物理内存做一个映射
+// 映射方式是direct-map, 直接映射, 
+// 即虚拟地址0对应物理地址0, 虚拟地址100 映射到物理地址100
+
+// 在内核地址没有被映射到物理地址之前, 操作系统是如何工作的?--下面的回答存疑
+// 在内核映射到物理地址之前, 操作系统使用的是内核虚拟地址, 不过由于虚拟地址和物理地址是一比一映射
+// 所以这个虚拟地址, 可以直接被当作物理地址使用
 pagetable_t
 kvmmake(void)
 {
   pagetable_t kpgtbl;
+  kpgtbl = (pagetable_t) kalloc(); //分配一个物理内存页
+  memset(kpgtbl, 0, PGSIZE);       //将这个物理内存页的所有内容都设置为0
 
-  kpgtbl = (pagetable_t) kalloc();
-  memset(kpgtbl, 0, PGSIZE);
+  // uart registers, 映射UART0设备
+  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W); 
 
-  // uart registers
-  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  // virtio mmio disk interface, 映射VIRTIO0设备
+  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W); 
 
-  // virtio mmio disk interface
-  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-
-  // PLIC
+  // PLIC, 映射PLIC设备欸
   kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
 
-  // map kernel text executable and read-only.
+  // map kernel text executable and read-only. 映射kernel的text
   kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
 
-  // map kernel data and the physical RAM we'll make use of.
+  // map kernel data and the physical RAM we'll make use of. 映射kernel的data段 
   kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
 
   // map the trampoline for trap entry/exit to
-  // the highest virtual address in the kernel.
+  // the highest virtual address in the kernel.  映射trampoline到内核
   kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
   // allocate and map a kernel stack for each process.
+  //分配并且映射一个内核栈, 到每个用户进程
   proc_mapstacks(kpgtbl);
   
   return kpgtbl;
 }
 
 // Initialize the one kernel_pagetable
+// 内核页表的初始化
+// 内核页表的初始化是调用kvmmake
 void
 kvminit(void)
 {
@@ -58,15 +69,23 @@ kvminit(void)
 
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
+// 这个函数有两个作用
+// 1. 切换/开启内核页表, 从此以后使用的都是虚拟内存
+//    在没有开启内核页表之前, 在操作系统里面使用的都是物理内存
+// 2. 刷新TLB
+//    如果更新了内核页表里面的内容, 如果想要让更新后的内核页表正常运转, 那么就需要将更新的内容让TLB知道
+//    否则TLB无法完成正常的映射
+//    因此如果是在已经开启页表功能之后, 再调用这个函数, 那么就是为了刷新TLB(为了使用更新后的虚拟地址)
 void
 kvminithart()
 {
   // wait for any previous writes to the page table memory to finish.
   sfence_vma();
 
+  //开启内核页表的分页功能
+  //satp寄存器, 存储的都是页表的实际物理地址
   w_satp(MAKE_SATP(kernel_pagetable));
-
-  // flush stale entries from the TLB.
+  // flush stale entries from the TLB. 刷新TLB
   sfence_vma();
 }
 
@@ -82,21 +101,42 @@ kvminithart()
 //   21..29 -- 9 bits of level-1 index.
 //   12..20 -- 9 bits of level-0 index.
 //    0..11 -- 12 bits of byte offset within the page.
+
+// walk函数的功能: 
+// walk函数返回和va相关联的那个最终的PTE的物理地址(三级页表的PTE)
+// 如果return 0, 说明该虚拟地址没有对应的PTE-->即没有对应的物理地址, 找不到该虚拟地址va对应的物理地址
+// 如果alloc不等于0, 会在函数执行的时候, 创建对应的PTE
+
+// walk函数的执行过程:  
+// 这个函数的具体执行行为, 最好和xvbook里面的图例一起看比较容易理解--然后自己手动模拟一遍
+// 看图模拟这个页表的行为
+
+// walk函数中, 在页表中寻找PTE的过程中, 使用的都是物理地址? 为什么是这样
+// 使用物理地址就是直接绕过了页表的虚实地址转换
+
+// 内存访问过程: 虚拟地址-->虚拟地址转化为物理地址-->在真正的物理地址里面取出数据
+//              页表进行虚实地址转换
+
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
   if(va >= MAXVA)
     panic("walk");
-
+  // walk函数只执行两次for循环, 分别是level = 2和level = 1, 最终level会等于0
+  // 当level等于0的时候, 就是最后的一层页表, 是不需要执行循环的
   for(int level = 2; level > 0; level--) {
+    // 虚拟地址va [EXT27] [一9] [二9] [三9] [offset12]
+    // level = 2时, PX(level, va) = 一9
+    // level = 1时, PX(level, va) = 二9
+    // level = 0时, PX(level, va) = 三9
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
       if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
         return 0;
-      memset(pagetable, 0, PGSIZE);
-      *pte = PA2PTE(pagetable) | PTE_V;
+      memset(pagetable, 0, PGSIZE);       
+      *pte = PA2PTE(pagetable) | PTE_V;   
     }
   }
   return &pagetable[PX(0, va)];
@@ -105,6 +145,15 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
 // Can only be used to look up user pages.
+// walk函数的功能:
+// 返回一个虚拟地址对应的物理地址
+// 如果return 0,  表示这个虚拟地址没有对应的物理地址映射, 即该虚拟地址没有被使用
+
+// walk函数的执行过程: 
+// walkaddr函数通过调用walk函数得到对应PTE的物理地址
+// 然后提取PTE里面的物理地址pa, 作为函数的返回值
+
+// 只能够查看用户进程? ----为什么呢?
 uint64
 walkaddr(pagetable_t pagetable, uint64 va)
 {
@@ -113,14 +162,19 @@ walkaddr(pagetable_t pagetable, uint64 va)
 
   if(va >= MAXVA)
     return 0;
-
   pte = walk(pagetable, va, 0);
+  //如果PTE=0, 表示该虚拟地址没有对应的PTE, 即该虚拟地址没有被使用
   if(pte == 0)
     return 0;
+  //如果PTE_V = 0, 即该PTE没有被使用, 说明该虚拟地址没有对应的物理地址
   if((*pte & PTE_V) == 0)
     return 0;
+  //如果PTE_U = 0, 说明该页面是非用户进程, 直接返回0
+  //因为我们想要的设置是, 该函数仅仅是对用户进程使用
+  //换句话说, 是内核页表用不到这么麻烦的寻址方式
   if((*pte & PTE_U) == 0)
     return 0;
+  //提取PTE里面的物理地址pa
   pa = PTE2PA(*pte);
   return pa;
 }
@@ -139,6 +193,10 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 // physical addresses starting at pa. va and size might not
 // be page-aligned. Returns 0 on success, -1 if walk() couldn't
 // allocate a needed page-table page.
+
+// 将虚拟地址va映射到对应的物理地址pa
+// 从va和pa开始映射, 一共映射size大小
+// 最后的地址是va +size 和 pa + size 
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
@@ -167,6 +225,9 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 // Remove npages of mappings starting from va. va must be
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
+
+// free物理内存的区别是, 释放物理内存是将该物理内存添加到kmem链表当中
+// 如果不释放, 则不将该物理内存添加到kmem链表当中, 这个物理内存可能就没有了
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
@@ -193,6 +254,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
 // create an empty user page table.
 // returns 0 if out of memory.
+// 创建一个空的用户页表
 pagetable_t
 uvmcreate()
 {
